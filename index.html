@@ -427,7 +427,7 @@ const startSolve = () => {
     const {solutions} = enumerateTilings(W,H, holes, tileTypes, uniqueByBoardSymmetry, 1);
     results = solutions;
     if(results.length){
-      stat.textContent = "1 layout found.";
+      stat.textContent = "";
       drawLayout(results[0]);
       btnDownload.disabled = false;
     } else {

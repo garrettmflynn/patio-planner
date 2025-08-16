@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Patio Tiler — Earth Tones</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --pad: 14px; font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+  body { margin: 0; background: #e9e4db; color: #3e3a33; }
+  header { padding: var(--pad); display: grid; gap: 8px; border-bottom: 1px solid #d8d2c8; background:#f6f3ee; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button {
+    background:#6f7a65; color:#fff; border:0; border-radius:10px; padding:10px 14px; cursor:pointer;
+  }
+  button:hover { filter: brightness(1.05); }
+  button:disabled { opacity:.45; cursor:default }
+  select { border:1px solid #c8c2b6; background:#fff; border-radius:8px; padding:8px 10px; }
+  #cfgEcho { font-size: 14px; opacity:.85 }
+  #wrap { display:grid; place-items:center; padding: var(--pad); }
+  canvas { width:min(94vw, 900px); height:auto; border-radius: 14px; background:#d7d1c6; box-shadow: 0 4px 18px rgba(0,0,0,.10); }
+  small.hint { opacity:.75 }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <button id="btnSolve">Lay Stones</button>
+    <button id="btnDownload" disabled>Download</button>
+    <button id="btnLoad">Load</button>
+    <span id="stat"></span>
+  </div>
+  <div class="row" id="cfgEcho"></div>
+</header>
+
+<div id="wrap"><canvas id="cv" width="1100" height="820"></canvas></div>
+
+<script>
+/* ============================================================
+   CONFIG — set your patio and stones here
+   ------------------------------------------------------------ */
+// Patio size in unit cells (e.g., 1 cell = one 6"x6" module)
+const W = 8, H = 6;
+
+// Optional holes (posts/drains), as "x,y" strings:
+const holes = new Set([
+  // "3,2",
+]);
+
+// Stones (polyominoes). Use rect(w,h) or custom shapes.
+// count: number of stones; set to null for unlimited.
+const tileTypes = [
+  tTile("Large",  rect(2,3),  6,   true, false),
+  tTile("Wide",   rect(3,2),  4,   true, false),
+  tTile("Square", rect(2,2),  8,   true, false),
+  tTile("Strip",  rect(1,2),  null, true, false), // unlimited filler
+];
+
+// Uniqueness up to patio rotate/flip (safe for rectangles, auto-ignored if holes break symmetry)
+const uniqueByBoardSymmetry = true;
+
+/* ============================================================
+   Less-stylized earth-tone rendering controls
+   ------------------------------------------------------------ */
+const STYLE = {
+  patioInsetPx: 22,
+  groutColor: "#bbb4a7",
+  groutWidthPx: 3,           // thinner, realistic joint
+  cornerRadiusPx: 6,         // small rounding
+  edgeShadeAlpha: 0.18,      // subtle inner edge darkening
+  speckleAlpha: 0.05,        // very light speckle
+  speckleDensity: 0.22,      // sparse speckle
+};
+
+/* Palette presets (earthy) */
+const PALETTE = { base: {h: 12, s: 40, l: 50}, jitter: {h:6,s:6,l:6} }
+
+function earthyColor(pal, seed) {
+  const r = mulberry32(seed);
+  const h = pal.base.h + (r()*2-1)*pal.jitter.h;
+  const s = pal.base.s + (r()*2-1)*pal.jitter.s;
+  const l = pal.base.l + (r()*2-1)*pal.jitter.l;
+  return `hsl(${h},${s}%,${l}%)`;
+}
+
+function drawGuideGrid(ox, oy, W, H, cell, groutColor) {
+  // derive a grid color that contrasts with grout & tiles
+  // slightly darker than grout
+  const gridColor = 'rgba(40, 40, 40, 1)'; // fallback
+  // if your grout is light, this will stand out
+  const alpha = 0.25
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = gridColor;
+  ctx.lineWidth = 1;
+
+  ctx.setLineDash([]);
+
+  // Align to half-pixel in CSS pixel space for crisp 1px lines
+  const x0 = Math.round(ox) + 0.5;
+  const y0 = Math.round(oy) + 0.5;
+  const wpx = Math.round(W * cell);
+  const hpx = Math.round(H * cell);
+
+  // verticals
+  for (let x = 0; x <= W; x++) {
+    const xx = x0 + Math.round(x * cell);
+    ctx.beginPath();
+    ctx.moveTo(xx, y0);
+    ctx.lineTo(xx, y0 + hpx);
+    ctx.stroke();
+  }
+  // horizontals
+  for (let y = 0; y <= H; y++) {
+    const yy = y0 + Math.round(y * cell);
+    ctx.beginPath();
+    ctx.moveTo(x0, yy);
+    ctx.lineTo(x0 + wpx, yy);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+/* ---------- Tile helpers ---------- */
+function tTile(name, cells, count=1, allowRot=true, allowReflect=false){
+  return { name, base: normShape(cells), count, allowRot, allowReflect };
+}
+function rect(w,h){ const s=[]; for(let y=0;y<h;y++) for(let x=0;x<w;x++) s.push([x,y]); return s; }
+function normShape(cells){
+  let minx=Infinity,miny=Infinity;
+  for(const [x,y] of cells){ if(x<minx)minx=x; if(y<miny)miny=y; }
+  const out = cells.map(([x,y])=>[x-minx,y-miny]).sort((a,b)=>a[1]-b[1]||a[0]-b[0]);
+  return out;
+}
+function rot90(c){ return c.map(([x,y])=>[-y,x]); }
+function reflX(c){ return c.map(([x,y])=>[-x,y]); }
+function orientations(base, rot=true, refl=false){
+  const seen = new Set(); const push = s => {
+    const n = normShape(s); const k = n.map(([x,y])=>x+","+y).join(";");
+    if(!seen.has(k)) seen.add(k);
+  };
+  const cand=[base]; if(rot){ let s=base; for(let i=0;i<3;i++){ s=rot90(s); cand.push(s);} }
+  for(const c of cand){ push(c); if(refl) push(reflX(c)); }
+  return [...seen].map(k=>k.split(";").filter(Boolean).map(p=>p.split(",").map(Number)));
+}
+
+/* ---------- Board ---------- */
+function boardCells(W,H,holes){ const out=[]; for(let y=0;y<H;y++) for(let x=0;x<W;x++){ const k=`${x},${y}`; if(!holes.has(k)) out.push([x,y]); } return out; }
+function boardSymTransforms(W,H){
+  const r0=(x,y)=>[x,y], r1=(x,y)=>[y,W-1-x], r2=(x,y)=>[W-1-x,H-1-y], r3=(x,y)=>[H-1-y,x];
+  const fx=(x,y)=>[W-1-x,y], fy=(x,y)=>[x,H-1-y], fd=(x,y)=>[y,x], fo=(x,y)=>[W-1-y,H-1-x];
+  return [r0,r1,r2,r3,fx,fy,fd,fo];
+}
+
+/* ---------- Placements ---------- */
+function precomputePlacements(W,H,boardSet,tiles){
+  const placements=[]; const byCell=new Map();
+  for(let ti=0;ti<tiles.length;ti++){
+    const t=tiles[ti];
+    for(const o of orientations(t.base,t.allowRot,t.allowReflect)){
+      const maxx=Math.max(...o.map(([x])=>x)), maxy=Math.max(...o.map(([,y])=>y));
+      for(let oy=0;oy<=H-1-maxy;oy++) for(let ox=0;ox<=W-1-maxx;ox++){
+        const abs = o.map(([x,y])=>[x+ox,y+oy]);
+        if(abs.every(([x,y])=>boardSet.has(`${x},${y}`))){
+          const pid=placements.length; placements.push({ti,cells:abs});
+          for(const [x,y] of abs){ const k=`${x},${y}`; if(!byCell.has(k)) byCell.set(k,[]); byCell.get(k).push(pid); }
+        }
+      }
+    }
+  }
+  return {placements, byCell};
+}
+
+/* ---------- Canonical key ---------- */
+function canonicalKey(layout, W,H, tiles, useSym, boardSet){
+  const T = useSym ? boardSymTransforms(W,H) : [ (x,y)=>[x,y] ];
+  let best=null;
+  outer: for(const f of T){
+    if(boardSet){
+      const TB=new Set();
+      for(const k of boardSet){ const [x,y]=k.split(",").map(Number); const [nx,ny]=f(x,y); TB.add(`${nx},${ny}`); }
+      if(TB.size!==boardSet.size) continue;
+      for(const k of boardSet) if(!TB.has(k)) continue outer;
+    }
+    const tPlac = layout.map(p=>({ti:p.ti, cells:p.cells.map(([x,y])=>f(x,y)).sort((a,b)=>a[1]-b[1]||a[0]-b[0])}));
+    tPlac.sort((A,B)=>{
+      const a=A.cells, b=B.cells, n=Math.min(a.length,b.length);
+      for(let i=0;i<n;i++){ if(a[i][1]!==b[i][1]) return a[i][1]-b[i][1]; if(a[i][0]!==b[i][0]) return a[i][0]-b[i][0]; }
+      return a.length-b.length || A.ti-B.ti;
+    });
+    const s = tPlac.map(p=>p.cells.map(([x,y])=>`${x},${y}`).join(";")).join("|");
+    if(best===null || s<best) best=s;
+  }
+  return best;
+}
+
+/* ---------- Solver (first solution only; count:null supported) ---------- */
+function enumerateTilings(W,H, holes, tiles, uniqueByBoardSymmetry=true, capSolutions=1){
+  const b = boardCells(W,H,holes);
+  const boardSet = new Set(b.map(([x,y])=>`${x},${y}`));
+  const {placements, byCell} = precomputePlacements(W,H, boardSet, tiles);
+
+  const allFinite = tiles.every(t => t.count != null);
+  if(allFinite){
+    const maxArea = tiles.reduce((a,t)=>a + t.count * t.base.length, 0);
+    if(maxArea < b.length) throw new Error("Not enough stone area to cover the patio.");
+  }
+
+  const remaining = b.map(([x,y])=>`${x},${y}`);
+  const covered = new Set();
+  const usedCounts = Array(tiles.length).fill(0);
+  const usedPlacements = [];
+  const seen = new Set();
+  const solutions=[];
+
+  function chooseCell(){
+    let best=null, bestLen=1e9;
+    for(const k of remaining){
+      if(covered.has(k)) continue;
+      let cand=0;
+      const list = byCell.get(k) || [];
+      for(const pid of list){
+        const {ti,cells}=placements[pid];
+        const limit = tiles[ti].count ?? Infinity;
+        if(usedCounts[ti] >= limit) continue;
+        let ok=true; for(const [x,y] of cells) if(covered.has(`${x},${y}`)){ ok=false; break; }
+        if(ok) cand++;
+      }
+      if(cand===0) return [k,0];
+      if(cand<bestLen){ bestLen=cand; best=k; if(bestLen===1) break; }
+    }
+    return [best,bestLen];
+  }
+
+  function rec(){
+    if(solutions.length>=capSolutions) return;
+    if(remaining.every(k=>covered.has(k))){
+      const layout = usedPlacements.map(pid => ({ti:placements[pid].ti, cells:placements[pid].cells}));
+      const key = canonicalKey(layout, W,H, tiles, uniqueByBoardSymmetry, boardSet);
+      if(!seen.has(key)){ seen.add(key); solutions.push(layout); }
+      return;
+    }
+    const [cellK, ways] = chooseCell();
+    if(ways===0) return;
+
+    const pids = (byCell.get(cellK)||[]).slice();
+    for(let i=pids.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [pids[i],pids[j]]=[pids[j],pids[i]]; }
+
+    for(const pid of pids){
+      if(solutions.length>=capSolutions) return;
+      const {ti,cells}=placements[pid];
+      const limit = tiles[ti].count ?? Infinity;
+      if(usedCounts[ti] >= limit) continue;
+      let ok=true; for(const [x,y] of cells) if(covered.has(`${x},${y}`)){ ok=false; break; }
+      if(!ok) continue;
+
+      usedCounts[ti]++;
+      for(const [x,y] of cells) covered.add(`${x},${y}`);
+      usedPlacements.push(pid);
+
+      rec();
+
+      if(solutions.length>=capSolutions) return;
+      usedPlacements.pop();
+      for(const [x,y] of cells) covered.delete(`${x},${y}`);
+      usedCounts[ti]--;
+    }
+  }
+
+  rec();
+  return {solutions, boardSet};
+}
+
+/* ---------- Earth-tone rendering (minimal styling) ---------- */
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d", { alpha: false });
+const stat = document.getElementById("stat");
+const cfgEcho = document.getElementById("cfgEcho");
+const btnSolve = document.getElementById("btnSolve");
+const btnDownload = document.getElementById("btnDownload");
+const btnLoad = document.getElementById("btnLoad");
+
+let results = [];
+
+function echoConfig(){
+  const fmtCount = v => (v==null ? "∞" : String(v));
+  cfgEcho.textContent =
+    `Patio ${W}×${H} cells · Stones: ` +
+    tileTypes.map(t => `${t.name} ${sizeOf(t.base)} (${fmtCount(t.count)})`).join(", ") +
+    ` · Uniqueness: ${uniqueByBoardSymmetry?'on':'off'}`;
+}
+function sizeOf(base){ const w=1+Math.max(...base.map(([x])=>x)), h=1+Math.max(...base.map(([,y])=>y)); return `${w}×${h}`; }
+
+function drawLayout(layout){
+  const pad = STYLE.patioInsetPx;
+  const cell = Math.floor((Math.min(cv.width, cv.height) - pad*2) / Math.max(W,H));
+  const ox = Math.floor((cv.width - cell*W)/2);
+  const oy = Math.floor((cv.height - cell*H)/2);
+  const groutW = Math.max(2, STYLE.groutWidthPx * (cell/48));
+  const radius = Math.min(STYLE.cornerRadiusPx, cell*0.3);
+
+  // base
+  ctx.fillStyle = "#ded8cd";
+  ctx.fillRect(0,0,cv.width,cv.height);
+
+  // patio plane (grout color background)
+  ctx.fillStyle = STYLE.groutColor;
+  ctx.fillRect(ox, oy, cell*W, cell*H);
+
+  drawGuideGrid(ox, oy, W, H, cell, STYLE.groutColor); // Under stones
+
+  // draw each stone
+  for (let i=0; i<layout.length; i++) {
+    const stone = layout[i];
+    const seed = hash32(i*2654435761 ^ stone.cells.length*971);
+    const col = earthyColor(PALETTE, seed);
+
+    const xs = stone.cells.map(([x])=>x), ys = stone.cells.map(([,y])=>y);
+    const minx = Math.min(...xs), maxx = Math.max(...xs);
+    const miny = Math.min(...ys), maxy = Math.max(...ys);
+
+    const x = ox + minx*cell;
+    const y = oy + miny*cell;
+    const w = (maxx-minx+1)*cell;
+    const h = (maxy-miny+1)*cell;
+
+    ctx.fillStyle = col;
+    ctx.fillRect(x, y, w, h);
+
+    // grout outline
+    ctx.strokeStyle = STYLE.groutColor;
+    ctx.lineWidth = STYLE.groutWidthPx;
+    ctx.strokeRect(x + ctx.lineWidth/2, y + ctx.lineWidth/2, w - ctx.lineWidth, h - ctx.lineWidth);
+    
+    }
+
+    drawGuideGrid(ox, oy, W, H, cell, STYLE.groutColor); // Over stones
+
+
+}
+
+function buildStonePath(cells, cell, ox, oy, r){
+  const edges = new Set();
+  for(const [x,y] of cells){
+    toggleEdge(edges,x,y,0); toggleEdge(edges,x,y,1);
+    toggleEdge(edges,x,y,2); toggleEdge(edges,x,y,3);
+  }
+  const segs=[];
+  for(const e of edges){
+    const [x,y,d]=e.split(",").map(Number);
+    if(d===0) segs.push([[x,y],[x+1,y]]);
+    if(d===1) segs.push([[x+1,y],[x+1,y+1]]);
+    if(d===2) segs.push([[x,y+1],[x+1,y+1]]);
+    if(d===3) segs.push([[x,y],[x,y+1]]);
+  }
+  const outline = traceOutline(segs);
+  const path = new Path2D();
+  if(!outline.length) return path;
+  const px = p => [ox + p[0]*cell, oy + p[1]*cell];
+  const R = Math.max(0, r);
+  const [sx,sy] = px(outline[0]);
+  path.moveTo(sx,sy);
+  for(let i=0;i<outline.length;i++){
+    const a = outline[i], b = outline[(i+1)%outline.length], c = outline[(i+2)%outline.length];
+    const [ax,ay] = px(a), [bx,by] = px(b), [cx,cy] = px(c);
+    const from = shortenTowards([ax,ay],[bx,by],R);
+    const to   = shortenTowards([cx,cy],[bx,by],R);
+    path.lineTo(from[0], from[1]);
+    path.quadraticCurveTo(bx,by, to[0], to[1]);
+  }
+  path.closePath();
+  return path;
+}
+
+function toggleEdge(set,x,y,d){ const key=`${x},${y},${d}`; if(set.has(key)) set.delete(key); else set.add(key); }
+function traceOutline(segs){
+  const adj = new Map(); const k = p => `${p[0]},${p[1]}`;
+  for(const [a,b] of segs){
+    const ka=k(a), kb=k(b);
+    if(!adj.has(ka)) adj.set(ka,[]); if(!adj.has(kb)) adj.set(kb,[]);
+    adj.get(ka).push(b); adj.get(kb).push(a);
+  }
+  let start=null;
+  for(const [kk] of adj){ const [x,y]=kk.split(",").map(Number); if(!start || y<start[1] || (y===start[1]&&x<start[0])) start=[x,y]; }
+  const loop=[start]; let curr=start, prev=[start[0]-1,start[1]];
+  for(let i=0;i<10000;i++){
+    const nbrs = adj.get(k(curr))||[]; if(!nbrs.length) break;
+    let best=null, bestAng=1e9;
+    for(const n of nbrs){ if(n[0]===prev[0]&&n[1]===prev[1]) continue;
+      const ang = turnAngle(prev,curr,n); if(ang<bestAng){ bestAng=ang; best=n; }
+    }
+    if(!best) break; prev=curr; curr=best;
+    if(curr[0]===loop[0][0] && curr[1]===loop[0][1]) break; loop.push(curr);
+  }
+  return loop;
+}
+function turnAngle(a,b,c){ const v1=[b[0]-a[0], b[1]-a[1]], v2=[c[0]-b[0], c[1]-b[1]];
+  const ang=Math.atan2(v1[0]*v2[1]-v1[1]*v2[0], v1[0]*v2[0]+v1[1]*v2[1]); return (ang<=0? ang+2*Math.PI : ang); }
+function shortenTowards(a,b,d){ const vx=b[0]-a[0], vy=b[1]-a[1]; const len=Math.hypot(vx,vy)||1; const t=Math.min(1, d/len); return [b[0]-vx*(1-t), b[1]-vy*(1-t)]; }
+
+/* ---------- Minimal texture ---------- */
+function lightSpeckle(path, seed, cell, density, alpha){
+  const r = mulberry32(seed);
+  ctx.save(); ctx.clip(path);
+  // approximate bounds by sampling; conservative fill
+  const Wp = Math.max(40, cell*2), Hp = Math.max(40, cell*2);
+  const n = Math.floor(density * (Wp*Hp/900));
+  for(let i=0;i<n;i++){
+    ctx.globalAlpha = alpha * (0.7 + r()*0.6);
+    ctx.fillStyle = r()<0.5 ? "rgba(0,0,0,0.6)" : "rgba(255,255,255,0.6)";
+    const x = (r()*cv.width)|0, y = (r()*cv.height)|0;
+    const s = 0.6 + r()*1.3;
+    ctx.fillRect(x,y,s,s);
+  }
+  ctx.restore();
+}
+
+/* ---------- Random ---------- */
+function hash32(x){ x|=0; x=(x+0x7ed55d16)+(x<<12); x=(x^0xc761c23c)^(x>>>19); x=(x+0x165667b1)+(x<<5); x=(x+0xd3a2646c)^(x<<9); x=(x+0xfd7046c5)+(x<<3); x=(x^0xb55a4f09)^(x>>>16); return (x>>>0); }
+function mulberry32(a){ return function(){ let t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
+function clamp(v,lo,hi){ return Math.max(lo, Math.min(hi,v)); }
+
+const startSolve = () => {
+    try {
+    stat.textContent = "Laying stones…";
+    results = [];
+    const {solutions} = enumerateTilings(W,H, holes, tileTypes, uniqueByBoardSymmetry, 1);
+    results = solutions;
+    if(results.length){
+      stat.textContent = "1 layout found.";
+      drawLayout(results[0]);
+      btnDownload.disabled = false;
+    } else {
+      stat.textContent = "No exact layout found.";
+      btnDownload.disabled = true;
+      ctx.clearRect(0,0,cv.width,cv.height);
+    }
+  } catch (e) {
+    console.error(e);
+    stat.textContent = "Error: " + e.message;
+    btnDownload.disabled = true;
+  }
+}
+
+/* ---------- UI ---------- */
+btnSolve.addEventListener("click", startSolve);
+btnDownload.addEventListener("click", () => {
+  if(!results.length) return;
+  const counts = {};
+  for(const p of results[0]) counts[tileTypes[p.ti].name] = (counts[tileTypes[p.ti].name]||0)+1;
+  const payload = {
+    board: {W,H, holes:[...holes]},
+    tiles: tileTypes.map(t=>({name:t.name, base:t.base, count:t.count, allowRot:t.allowRot, allowReflect:t.allowReflect})),
+    uniqueByBoardSymmetry,
+    layout: { countsUsed: counts, placements: results[0].map(p=>({tile: tileTypes[p.ti].name, cells: p.cells})) }
+  };
+  const blob = new Blob([JSON.stringify(payload,null,2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `patio-layout-${W}x${H}.json`;
+  document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+});
+
+const loadJSONData = (file) => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        resolve(data);
+      } catch (e) {
+        reject(new Error("Invalid JSON format."));
+      }
+    };
+    reader.onerror = () => reject(new Error("Error reading file."));
+    reader.readAsText(file);
+  });
+};
+
+const loadJSONFileFromFileSystem = () => {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = () => {
+      if (input.files.length === 0) {
+        resolve(null);
+        return;
+      }
+      const file = input.files[0];
+      loadJSONData(file).then(resolve).catch(reject);
+    };
+    input.click();
+  });
+};
+
+btnLoad.addEventListener("click", async () => {
+  const data = await loadJSONFileFromFileSystem()
+  if(!data) return alert("No file selected.");
+  try {
+    if(!data.layout) throw new Error("Invalid layout format.");
+    results = [
+        data.layout.placements.map(p => ({ti: tileTypes.findIndex(t => t.name === p.tile), cells: p.cells}))
+    ]
+
+    drawLayout(results[0]);
+    btnDownload.disabled = false;
+  } catch (e) {
+    alert("Error loading layout: " + e.message);
+  }
+});
+
+function initBackdrop(){
+  ctx.fillStyle = "#e4dfd6";
+  ctx.fillRect(0,0,cv.width,cv.height);
+}
+function sizeOf(base){ const w=1+Math.max(...base.map(([x])=>x)), h=1+Math.max(...base.map(([,y])=>y)); return `${w}×${h}`; }
+echoConfig();
+initBackdrop();
+
+
+startSolve()
+
+</script>
+</body>
+</html>

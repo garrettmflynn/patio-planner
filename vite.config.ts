@@ -1,13 +1,12 @@
 export default {
     base: './',
-    // Add pages to build
     build: {
         rollupOptions: {
             input: {
                 main: 'index.html',
                 planner: 'planner.html',
                 solver: 'solver.html',
-                complexSolver: 'complexSolver.html',
+                // complexSolver: 'complexSolver.html',
             }
         }
     }

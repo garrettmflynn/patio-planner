@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Patio Planner</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --pad: 14px; font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+  body { margin: 0; background: #e9e4db; color: #3e3a33; }
+  header { padding: var(--pad); display: grid; gap: 8px; border-bottom: 1px solid #d8d2c8; background:#f6f3ee; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { background:#6f7a65; color:#fff; border:0; border-radius:10px; padding:10px 14px; cursor:pointer; }
+  button:hover { filter: brightness(1.05); }
+  button:disabled { opacity:.45; cursor:default }
+  select { border:1px solid #c8c2b6; background:#fff; border-radius:8px; padding:8px 10px; }
+  #cfgEcho { font-size: 14px; opacity:.85 }
+  #wrap { display:grid; place-items:center; padding: var(--pad); }
+  canvas { width:min(94vw, 900px); height:auto; border-radius: 14px; background:#d7d1c6; box-shadow: 0 4px 18px rgba(0,0,0,.10); }
+  small.hint { opacity:.75 }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <button id="btnSolve">Lay Stones</button>
+    <button id="btnCancel" disabled>Cancel</button>
+    <button id="btnDownload" disabled>Download</button>
+    <button id="btnLoad">Load</button>
+    <label>Balance:
+      <select id="balancePreset">
+        <option value="none" selected>None (first valid)</option>
+        <option value="even">Even mix</option>
+        <option value="orient">Orientation 50/50</option>
+        <option value="seams">Minimal seams</option>
+        <option value="custom">Custom (from code)</option>
+      </select>
+    </label>
+    <span id="stat"></span>
+  </div>
+  <div class="row" id="cfgEcho"></div>
+</header>
+
+<div id="wrap"><canvas id="cv" width="1100" height="820"></canvas></div>
+
+<script type="module">
+  import solverWorker from './solver.worker.js?worker'; // Import the worker script
+
+  /* ============================================================
+    BOARD IN FEET, SOLVER IN INCH UNITS (auto-picked)
+  ============================================================ */
+  const FOOT_IN = 12;                                      // inches per foot
+  const FEET_W = (96 / FOOT_IN), FEET_H = (158 / FOOT_IN); // board in feet
+
+  const cutSixByTwelves = 33;
+
+  // Declare tiles in INCHES here (wIn, hIn). Counts can be finite or null.
+  const RAW_TILES_IN = [
+    ["6x12", 6, 12, 159 + cutSixByTwelves, true,  false],
+    ["12x12", 12, 12, 8, true, false],
+    ["Filler", 12, 12, null, false, false], // filler tile (1x1) for solver
+  ];
+
+  // Holes in FEET (x,y,w,h) — we’ll expand to inch units.
+  const HOLES_FEET = [
+    // [7, 3, (26/FOOT_IN), (26/FOOT_IN)],
+  ];
+
+  /* ============================================================
+    Auto unit picker (inches per solver cell)
+    -> smallest divider that fits feet grid, ALL tile dims,
+       and ALL hole positions & sizes *exactly*.
+       This ensures 25" (etc.) are represented precisely.
+  ============================================================ */
+  const gcd = (a,b)=> b?gcd(b,a%b):Math.abs(a);
+  function gcdMany(nums){ return nums.reduce((g,n)=>gcd(g,n)); }
+
+  // tile dimensions in inches
+  const tileDimsIn = RAW_TILES_IN.flatMap(t => [t[1], t[2]]);
+  // hole positions/sizes in inches (rounded to nearest inch to avoid float slop)
+  const holeDimsIn = HOLES_FEET.flatMap(([xf,yf,wf,hf]) => [
+    Math.round(xf * FOOT_IN),
+    Math.round(yf * FOOT_IN),
+    Math.round(wf * FOOT_IN),
+    Math.round(hf * FOOT_IN),
+  ]);
+
+  // include FOOT_IN so the foot grid aligns on unit boundaries
+  const dimsIn = tileDimsIn.concat([FOOT_IN, FOOT_IN]).concat(holeDimsIn);
+
+  // inches per solver cell (1,2,3,4,6,12). Will become 1" when needed (e.g., 25").
+  const UNIT_IN = gcdMany(dimsIn);
+  const UNITS_PER_FOOT = FOOT_IN / UNIT_IN;
+
+  // board in unit cells (integers)
+  const GRID_W = Math.round(FEET_W * UNITS_PER_FOOT);
+  const GRID_H = Math.round(FEET_H * UNITS_PER_FOOT);
+
+  /* ============================================================
+    Build solver-ready tiles (in unit cells)
+  ============================================================ */
+  function tTile(name, cells, count=1, allowRot=true, allowReflect=false){
+    return { name, base: normShape(cells), count, allowRot, allowReflect };
+  }
+  function rectUnits(wIn, hIn){
+    const w = Math.round(wIn / UNIT_IN), h = Math.round(hIn / UNIT_IN);
+    const s=[]; for(let y=0;y<h;y++) for(let x=0;x<w;x++) s.push([x,y]);
+    return s;
+  }
+  const tileTypes = RAW_TILES_IN.map(([name, wIn, hIn, count, r, refl]) =>
+    tTile(name, rectUnits(wIn, hIn), count, r, refl)
+  );
+
+  /* Expand foot holes to unit holes (integer math to avoid drift) */
+  function holeRectFeetToUnits(xf,yf,wf,hf){
+    const x0 = Math.round(xf * UNITS_PER_FOOT);
+    const y0 = Math.round(yf * UNITS_PER_FOOT);
+    const wU = Math.round(wf * UNITS_PER_FOOT);
+    const hU = Math.round(hf * UNITS_PER_FOOT);
+    const cells=[];
+    for(let y=0; y<hU; y++)
+      for(let x=0; x<wU; x++)
+        cells.push([x0 + x, y0 + y]);
+    return cells;
+  }
+  const holesUnits = new Set(HOLES_FEET.flatMap(([x,y,w,h]) =>
+    holeRectFeetToUnits(x,y,w,h).map(([ux,uy]) => `${ux},${uy}`)
+  ));
+
+  /* ============================================================
+    Rendering
+  ============================================================ */
+  const STYLE = { patioInsetPx: 22, groutColor: "#bbb4a7", groutWidthPx: 2 };
+  const PALETTE = { base: {h: 12, s: 40, l: 50}, jitter: {h:6,s:6,l:6} };
+
+  function earthyColor(pal, seed) {
+    const r = mulberry32(seed);
+    const h = pal.base.h + (r()*2-1)*pal.jitter.h;
+    const s = pal.base.s + (r()*2-1)*pal.jitter.s;
+    const l = pal.base.l + (r()*2-1)*pal.jitter.l;
+    return `hsl(${h},${s}%,${l}%)`;
+  }
+
+  function drawGuideGridFoot(ox, oy, cellPx, ctx, feetW, feetH){
+    // Draw 1′ grid (every UNITS_PER_FOOT unit-cells)
+    const gridColor = 'rgba(40, 40, 40, 1)';
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.strokeStyle = gridColor;
+    ctx.lineWidth = 1;
+
+    const x0 = Math.round(ox) + 0.5;
+    const y0 = Math.round(oy) + 0.5;
+    const wpx = Math.round(GRID_W * cellPx);
+    const hpx = Math.round(GRID_H * cellPx);
+
+    // vertical foot lines
+    for(let xf=0; xf<=feetW; xf++){
+      const xx = x0 + Math.round(xf * UNITS_PER_FOOT * cellPx);
+      ctx.beginPath(); ctx.moveTo(xx, y0); ctx.lineTo(xx, y0 + hpx); ctx.stroke();
+    }
+    // horizontal foot lines
+    for(let yf=0; yf<=feetH; yf++){
+      const yy = y0 + Math.round(yf * UNITS_PER_FOOT * cellPx);
+      ctx.beginPath(); ctx.moveTo(x0, yy); ctx.lineTo(x0 + wpx, yy); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /* ---------- Tile helpers (display only) ---------- */
+  function normShape(cells){
+    let minx=Infinity,miny=Infinity;
+    for(const [x,y] of cells){ if(x<minx)minx=x; if(y<miny)miny=y; }
+    return cells.map(([x,y])=>[x-minx,y-miny]).sort((a,b)=>a[1]-b[1]||a[0]-b[0]);
+  }
+
+  /* ---------- Canvas & UI ---------- */
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d", { alpha: false });
+  const stat = document.getElementById("stat");
+  const cfgEcho = document.getElementById("cfgEcho");
+  const btnSolve = document.getElementById("btnSolve");
+  const btnCancel = document.getElementById("btnCancel");
+  const btnDownload = document.getElementById("btnDownload");
+  const btnLoad = document.getElementById("btnLoad");
+  const selPreset = document.getElementById("balancePreset");
+
+  let results = [];
+
+  function echoConfig(){
+    const fmtCount = v => (v==null ? "∞" : String(v));
+    const tileDesc = tileTypes.map(t=>{
+      const wUnits = 1+Math.max(...t.base.map(([x])=>x));
+      const hUnits = 1+Math.max(...t.base.map(([,y])=>y));
+      const wIn = wUnits*UNIT_IN, hIn = hUnits*UNIT_IN;
+      return `${t.name} ${wIn}"×${hIn}" (${fmtCount(t.count)})`;
+    }).join(", ");
+
+    const boardWIn = FEET_W * FOOT_IN;
+    const boardHIn = FEET_H * FOOT_IN;
+
+    const holesEcho = HOLES_FEET.map(([xf,yf,wf,hf])=>{
+      const xi = Math.round(xf*FOOT_IN), yi = Math.round(yf*FOOT_IN);
+      const wi = Math.round(wf*FOOT_IN), hi = Math.round(hf*FOOT_IN);
+      return `hole @ (${xi}", ${yi}") size ${wi}"×${hi}"`;
+    }).join("; ");
+
+    cfgEcho.textContent =
+      `Board ${boardWIn}"×${boardHIn}" · Unit ${UNIT_IN}" (${UNITS_PER_FOOT}/ft) → ${GRID_W}×${GRID_H} cells · Stones: ${tileDesc}${holesEcho ? " · " + holesEcho : ""}`;
+  }
+
+  function drawLayout(layout){
+    const pad = STYLE.patioInsetPx;
+    const cellPx = Math.floor((Math.min(cv.width, cv.height) - pad*2) / Math.max(GRID_W, GRID_H));
+    const ox = Math.floor((cv.width  - cellPx*GRID_W)/2);
+    const oy = Math.floor((cv.height - cellPx*GRID_H)/2);
+
+    ctx.fillStyle = "#ded8cd"; ctx.fillRect(0,0,cv.width,cv.height);
+    ctx.fillStyle = STYLE.groutColor; ctx.fillRect(ox, oy, cellPx*GRID_W, cellPx*GRID_H);
+
+    // Underlay foot grid
+    drawGuideGridFoot(ox, oy, cellPx, ctx, FEET_W, FEET_H);
+
+    // Tiles as crisp rectangles (unit grid)
+    for (let i=0; i<layout.length; i++) {
+      const stone = layout[i];
+      const seed = hash32(i*2654435761 ^ stone.cells.length*971);
+      const col = earthyColor(PALETTE, seed);
+
+      const xs = stone.cells.map(([x])=>x), ys = stone.cells.map(([,y])=>y);
+      const minx = Math.min(...xs), maxx = Math.max(...xs);
+      const miny = Math.min(...ys), maxy = Math.max(...ys);
+
+      const x = ox + minx*cellPx;
+      const y = oy + miny*cellPx;
+      const w = (maxx-minx+1)*cellPx;
+      const h = (maxy-miny+1)*cellPx;
+
+      ctx.fillStyle = col; ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = STYLE.groutColor; ctx.lineWidth = STYLE.groutWidthPx;
+      ctx.strokeRect(x + ctx.lineWidth/2, y + ctx.lineWidth/2, w - ctx.lineWidth, h - ctx.lineWidth);
+    }
+
+    // Overlay foot grid
+    drawGuideGridFoot(ox, oy, cellPx, ctx, FEET_W, FEET_H);
+  }
+
+  /* ---------- Random ---------- */
+  function hash32(x){ x|=0; x=(x+0x7ed55d16)+(x<<12); x=(x^0xc761c23c)^(x>>>19); x=(x+0x165667b1)+(x<<5); x=(x+0xd3a2646c)^(x<<9); x=(x+0xfd7046c5)+(x<<3); x=(x^0xb55a4f09)^(x>>>16); return (x>>>0); }
+  function mulberry32(a){ return function(){ let t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
+
+  /* ============================================================
+    Web Worker (solver) — supports balance + none
+  ============================================================ */
+
+  /* ---------- Presets -> BALANCE config ---------- */
+  function balanceFromPreset(preset) {
+    if (preset === 'none') {
+      return { noBalance: true, maxSolutionsToEvaluate: 1 };
+    }
+    const base = {
+      desiredMix: null,
+      weights: { tileCountVariance: 1.0, orientationBalance: 0.6, seamPenalty: 0.8, crossJoints: 0.4 },
+      maxSolutionsToEvaluate: 1500
+    };
+    if (preset === 'even')   return base;
+    if (preset === 'orient') return {...base, weights: {...base.weights, orientationBalance: 1.2, seamPenalty: 0.5, tileCountVariance: 0.7}};
+    if (preset === 'seams')  return {...base, weights: {...base.weights, seamPenalty: 1.5, crossJoints: 0.6, tileCountVariance: 0.5, orientationBalance: 0.4}};
+    // custom
+    return {
+      desiredMix: null, // e.g. { "6x12": 0.35, "8x16": 0.25, ... }
+      weights: { tileCountVariance: 1.0, orientationBalance: 0.6, seamPenalty: 0.8, crossJoints: 0.4 },
+      maxSolutionsToEvaluate: 1500
+    };
+  }
+
+  /* ---------- Orchestration ---------- */
+  let worker = null;
+  function startSolve() {
+    if (worker) { worker.terminate(); worker = null; }
+    worker = new solverWorker();
+
+    const preset = selPreset.value;
+    const balanceCfg = balanceFromPreset(preset);
+    stat.textContent = preset === 'none'
+      ? "Searching for the first exact layout…"
+      : "Searching for a balanced layout…";
+    btnSolve.disabled = true;
+    btnCancel.disabled = true;
+    btnDownload.disabled = true;
+
+    worker.onmessage = (e) => {
+      const msg = e.data || {};
+      if (msg.type === 'progress') {
+        stat.textContent = `Explored ${msg.nodes?.toLocaleString?.() || 0} nodes · Found ${msg.found} layouts…`;
+        btnCancel.disabled = false;
+      } else if (msg.type === 'infeasible') {
+        const bullet = (s) => `• ${s}`;
+        stat.innerHTML = `No exact layout is possible:<br>${(msg.reasons || []).map(bullet).join('<br>')}`;
+        btnSolve.disabled = false; btnCancel.disabled = true; btnDownload.disabled = true;
+        worker.terminate(); worker = null;
+      } else if (msg.type === 'result') {
+        if (!msg.layout) {
+          stat.textContent = "No exact layout found.";
+          btnSolve.disabled = false; btnCancel.disabled = true; return;
+        }
+        results = [msg.layout];
+        const preset = selPreset.value;
+        stat.textContent = preset === 'none' ? "Layout found." : "Balanced layout selected.";
+        drawLayout(results[0]);
+        btnSolve.disabled = false; btnCancel.disabled = true; btnDownload.disabled = false;
+        worker.terminate(); worker = null;
+      } else if (msg.type === 'error') {
+        stat.textContent = "Error: " + msg.message;
+        btnSolve.disabled = false; btnCancel.disabled = true;
+        worker.terminate(); worker = null;
+      }
+    };
+
+    // Send UNIT-based board + tiles
+    const payload = {
+      W: GRID_W,
+      H: GRID_H,
+      holes: [...holesUnits],          // unit holes as "x,y"
+      tileTypes,                       // unit-based shapes
+      uniqueByBoardSymmetry: false,
+      balance: balanceCfg,
+      cap: balanceCfg.maxSolutionsToEvaluate
+    };
+    worker.postMessage({cmd:'solve', payload});
+  }
+
+  function cancelSolve() {
+    if (worker) {
+      worker.terminate(); worker = null;
+      stat.textContent = "Search cancelled.";
+      btnSolve.disabled = false; btnCancel.disabled = true;
+    }
+  }
+
+  /* ---------- Download / Load ---------- */
+  btnSolve.addEventListener("click", startSolve);
+  btnCancel.addEventListener("click", cancelSolve);
+
+  btnDownload.addEventListener("click", () => {
+    if(!results.length) return;
+    const counts = {};
+    for(const p of results[0]) counts[tileTypes[p.ti].name] = (counts[tileTypes[p.ti].name]||0)+1;
+    const payload = {
+      units: { unitInches: UNIT_IN, unitsPerFoot: UNITS_PER_FOOT, gridW: GRID_W, gridH: GRID_H, boardFeet: {w: FEET_W, h: FEET_H} },
+      holes: [...holesUnits],
+      tiles: tileTypes.map(t=>({name:t.name, base:t.base, count:t.count, allowRot:t.allowRot, allowReflect:t.allowReflect})),
+      layout: { countsUsed: counts, placements: results[0].map(p=>({tile: tileTypes[p.ti].name, cells: p.cells})) }
+    };
+    const blob = new Blob([JSON.stringify(payload,null,2)], {type:"application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `patio-layout-${FEET_W}x${FEET_H}ft-${UNIT_IN}in-unit.json`;
+    document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+  });
+
+  function loadJSONData(file){
+    return new Promise((resolve,reject)=>{
+      const reader = new FileReader();
+      reader.onload = () => { try { resolve(JSON.parse(reader.result)); } catch { reject(new Error("Invalid JSON format.")); } };
+      reader.onerror = () => reject(new Error("Error reading file."));
+      reader.readAsText(file);
+    });
+  }
+  function loadJSONFileFromFileSystem(){
+    return new Promise((resolve,reject)=>{
+      const input = document.createElement("input");
+      input.type = "file"; input.accept = ".json";
+      input.onchange = () => {
+        if (!input.files.length) { resolve(null); return; }
+        loadJSONData(input.files[0]).then(resolve).catch(reject);
+      };
+      input.click();
+    });
+  }
+  btnLoad.addEventListener("click", async () => {
+    const data = await loadJSONFileFromFileSystem();
+    if(!data) return alert("No file selected.");
+    try {
+      if(!data.layout) throw new Error("Invalid layout format.");
+      results = [
+        data.layout.placements.map(p => ({ti: tileTypes.findIndex(t => t.name === p.tile), cells: p.cells}))
+      ];
+      drawLayout(results[0]);
+      btnDownload.disabled = false;
+      stat.textContent = "Layout loaded.";
+    } catch (e) {
+      alert("Error loading layout: " + e.message);
+    }
+  });
+
+  /* ---------- Boot ---------- */
+  function initBackdrop(){ ctx.fillStyle = "#e4dfd6"; ctx.fillRect(0,0,cv.width,cv.height); }
+  echoConfig();
+  initBackdrop();
+  startSolve();
+</script>
+</body>
+</html>

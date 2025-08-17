@@ -7,9 +7,12 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - Keyboard: 1–7 select tile type, R / [ / ] rotate, Del/Backspace delete, Ctrl/⌘+Z undo, Ctrl/⌘+Y redo
  * - Snap: 1", 2", 4", 6" (hold Alt while placing to bypass snap for that click)
  * - Persist: auto-saves placements/scale/snap to localStorage; Export/Import JSON (placements only)
- * - Autofill: fills remaining area around manual placements with fixed inventory (largest-first, inventory-safe)
- * - Constraints: cannot overlap, cannot cover the original 25×25 hole, must lie inside 104×157
- * - Inventory: **fixed** (not editable interactively). Remaining counts update as you place tiles.
+ * - Autofill: fills remaining area around manual placements with fixed inventory (largest-first, inventory-aware)
+ * - Placement rules:
+ *     • Allowed to overhang patio edges, but a tile cannot be placed entirely outside the patio.
+ *     • Overlap into the original 25×25 hole is allowed but treated as CUT (hatched + counted in trim area).
+ *     • Tiles cannot overlap each other.
+ * - Inventory: fixed (not editable). Remaining counts update as you place tiles.
  */
 
 // -------------------- Geometry (inches) --------------------
@@ -42,17 +45,43 @@ const TYPE_INDEX = Object.fromEntries(TILE_TYPES.map((t,i)=>[t.key,i]));
 
 // -------------------- Utilities --------------------
 const LS_KEY = "patio-planner-v4";
-function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
 function rectsOverlap(a,b){ return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
-function insidePatio(r){ return r.x >= 0 && r.y >= 0 && r.x + r.w <= W && r.y + r.h <= H; }
-function intersectsHole(r){ return false; }
 function snapValue(v, grid){ return Math.round(v / grid) * grid; }
 function rotateSize(w,h){ return { w: h, h: w }; }
 function uid(){ return Math.random().toString(36).slice(2,9); }
 
-// Check if a rectangle can be placed with current placements
+// Patio boundary helpers
+function entirelyOutside(r){
+  return (r.x + r.w <= 0) || (r.x >= W) || (r.y + r.h <= 0) || (r.y >= H);
+}
+
+// Treat hole-overlap as “outside” for cut accounting
+function holeTrimInfo(tile){
+  const hx1 = ORIGINAL_HOLE.x, hy1 = ORIGINAL_HOLE.y;
+  const hx2 = hx1 + ORIGINAL_HOLE.w, hy2 = hy1 + ORIGINAL_HOLE.h;
+  const x1 = Math.max(tile.x, hx1), y1 = Math.max(tile.y, hy1);
+  const x2 = Math.min(tile.x + tile.w, hx2), y2 = Math.min(tile.y + tile.h, hy2);
+  const iw = Math.max(0, x2 - x1), ih = Math.max(0, y2 - y1);
+  if (iw <= 0 || ih <= 0) return null;
+  return { x: x1, y: y1, w: iw, h: ih, area: iw * ih };
+}
+
+// Edge overflow accounting (overhang outside the patio)
+function overflowInfo(tile){
+  const x1 = tile.x, y1 = tile.y, x2 = tile.x + tile.w, y2 = tile.y + tile.h;
+  const left   = Math.max(0, -x1);
+  const right  = Math.max(0, x2 - W);
+  const top    = Math.max(0, -y1);
+  const bottom = Math.max(0, y2 - H);
+  if (!left && !right && !top && !bottom) return null;
+  const insideW = Math.max(0, Math.min(x2, W) - Math.max(x1, 0));
+  const area = left*tile.h + right*tile.h + top*insideW + bottom*insideW;
+  return { left, right, top, bottom, area };
+}
+
+// Placement validity (allows partial overhang & hole overlap; forbids full outside & tile overlap)
 function canPlace(rect, placements, ignoreId){
-  if (!insidePatio(rect) || intersectsHole(rect)) return false;
+  if (entirelyOutside(rect)) return false;
   for (const p of placements){ if (ignoreId && p.id===ignoreId) continue; if (rectsOverlap(rect,p)) return false; }
   return true;
 }
@@ -61,37 +90,38 @@ function canPlace(rect, placements, ignoreId){
 function savePlan(state){ try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch {} }
 function loadPlan(){ try { const raw = localStorage.getItem(LS_KEY); if (!raw) return null; return JSON.parse(raw); } catch { return null; } }
 
-// -------------------- Autofill (largest-first greedy) --------------------
+// -------------------- Autofill (largest-first, inventory-aware) --------------------
 /**
- * Simple greedy autofill:
+ * Greedy autofill:
  *  - Scans at 1" steps
- *  - Tries tiles from largest area to smallest (both orientations)
- *  - Respects fixed inventory **minus** what you've already placed
+ *  - Tries larger targets first (12×12 then 6×12), both orientations
+ *  - Allows span across hole and patio edges, but never fully outside; counts those areas as cuts
  */
 function autofill(placements, remainingInv){
   const result = []; // new placements only
   const occupied = [...placements];
-  const types = [...TILE_TYPES].sort((a,b)=> (b.w*b.h) - (a.w*a.h));
+  const targets = [
+    { key:"12x12", w:12, h:12, color:"#cdb4db" },
+    { key:"6x12",  w:12, h:6,  color:"#8ecae6" },
+  ];
 
-  function tryPlaceAt(x,y,type,rot){
-    const size = rot ? rotateSize(type.w,type.h) : { w:type.w, h:type.h };
+  function tryPlaceAt(x,y,t,rot){
+    const size = rot ? rotateSize(t.w,t.h) : { w:t.w, h:t.h };
     const rect = { x, y, w:size.w, h:size.h };
-    if ((remainingInv[type.key]||0) <= 0) return false;
+    if ((remainingInv[t.key]||0) <= 0) return false;
     if (!canPlace(rect, occupied)) return false;
     const id = uid();
-    const tile = { id, key:type.key, x, y, w:rect.w, h:rect.h, rot:!!rot, color:type.color, auto:true };
-    occupied.push(tile); result.push(tile); remainingInv[type.key]--; return true;
+    const tile = { id, key:t.key, x, y, w:rect.w, h:rect.h, rot:!!rot, color:t.color, auto:true };
+    occupied.push(tile); result.push(tile); remainingInv[t.key]--; return true;
   }
 
-  for (let y=0; y<=H-1; y+=1){
-    for (let x=0; x<=W-1; x+=1){
-      // skip if already occupied
-      if (occupied.some(p => x>=p.x && x<p.x+p.w && y>=p.y && y<p.y+p.h)) continue;
-      // skip if inside hole
-      
-      for (const t of types){
-        if (tryPlaceAt(x,y,t,false)) break;
-        if (tryPlaceAt(x,y,t,true)) break;
+  for (const t of targets){
+    for (let y=0; y<=H-1; y+=1){
+      for (let x=0; x<=W-1; x+=1){
+        // skip if already occupied at that point
+        if (occupied.some(p => x>=p.x && x<p.x+p.w && y>=p.y && y<p.y+p.h)) continue;
+        if (tryPlaceAt(x,y,t,false)) continue;
+        tryPlaceAt(x,y,t,true);
       }
     }
   }
@@ -136,28 +166,26 @@ export default function PatioPlannerInteractive(){
     return r;
   },[usedCounts]);
 
-  // --- New: Overflow (outside-grid) accounting ---
-  const PATIO_RECT = { x:0, y:0, w:W, h:H };
-  function overflowInfo(tile){
-    const x1 = tile.x, y1 = tile.y, x2 = tile.x + tile.w, y2 = tile.y + tile.h;
-    const left   = Math.max(0, -x1);
-    const right  = Math.max(0, x2 - W);
-    const top    = Math.max(0, -y1);
-    const bottom = Math.max(0, y2 - H);
-    if (!left && !right && !top && !bottom) return null;
-    const insideW = Math.max(0, Math.min(x2, W) - Math.max(x1, 0));
-    const insideH = Math.max(0, Math.min(y2, H) - Math.max(y1, 0));
-    const area = left*tile.h + right*tile.h + top*insideW + bottom*insideW;
-    return { left, right, top, bottom, area, insideW, insideH };
-  }
+  // --- Cut accounting (edge overflow + hole overlap) ---
   const overflowList = useMemo(()=>{
     const items = [];
-    for (const p of placements){ const ov = overflowInfo(p); if (ov){ items.push({ id:p.id, key:p.key, ...ov }); } }
+    for (const p of placements){ const ov = overflowInfo(p); if (ov){ items.push({ id:p.id, key:p.key, type:"EDGE", ...ov }); } }
     return items;
   },[placements]);
-  const totalTrimArea = useMemo(()=> overflowList.reduce((a,i)=>a + i.area, 0), [overflowList]);
 
-  // Place at mouse (allow partially outside, still forbid hole & overlaps)
+  const holeList = useMemo(()=>{
+    const items = [];
+    for (const p of placements){ const hi = holeTrimInfo(p); if (hi){ items.push({ id:p.id+"-hole", key:p.key, type:"HOLE", ...hi }); } }
+    return items;
+  },[placements]);
+
+  const totalTrimArea = useMemo(()=>{
+    const edge = overflowList.reduce((a,i)=>a + i.area, 0);
+    const hole = holeList.reduce((a,i)=>a + i.area, 0);
+    return edge + hole;
+  }, [overflowList, holeList]);
+
+  // Place at mouse (allow partially outside; forbid fully outside; forbid overlap)
   const svgRef = useRef(null);
   function placeAt(clientX, clientY, altSnap=false){
     const svg = svgRef.current; if (!svg) return;
@@ -168,11 +196,9 @@ export default function PatioPlannerInteractive(){
     const doSnap = altSnap ? 1 : snap;
     x = snapValue(x, doSnap); y = snapValue(y, doSnap);
     const rect = { x, y, w: type.w, h: type.h };
-    // inventory check
-    if ((remaining[selectedKey]||0) <= 0) return; // out of stock
-    // forbid covering the original hole, and forbid overlap with other tiles (even outside)
-    
-    for (const p of placements){ if (rectsOverlap(rect, p)) return; }
+    if ((remaining[selectedKey]||0) <= 0) return;                // out of stock
+    if (entirelyOutside(rect)) return;                           // cannot place fully outside
+    for (const p of placements){ if (rectsOverlap(rect, p)) return; } // no tile overlap
     const p = { id: uid(), key: selectedKey, x, y, w: type.w, h: type.h, rot: false, color: type.color };
     pushHistory(); setPlacements(prev=>[...prev, p]); setSelectedId(p.id);
   }
@@ -182,7 +208,7 @@ export default function PatioPlannerInteractive(){
   function undo(){ const last = undoStack[undoStack.length-1]; if (!last) return; setUndo(u=>u.slice(0,-1)); setRedo(r=>[...r,{ placements: JSON.stringify(placements) }]); setPlacements(JSON.parse(last.placements)); setSelectedId(null); }
   function redo(){ const last = redoStack[redoStack.length-1]; if (!last) return; setRedo(r=>r.slice(0,-1)); setUndo(u=>[...u,{ placements: JSON.stringify(placements) }]); setPlacements(JSON.parse(last.placements)); setSelectedId(null); }
 
-  // Drag to move (allow outside, still block overlaps/hole)
+  // Drag to move (allow outside; forbid fully outside and overlap at drop)
   function onMouseDown(e){
     const svg = svgRef.current; if (!svg) return;
     const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY; const ctm = svg.getScreenCTM(); if (!ctm) return; const loc = pt.matrixTransform(ctm.inverse());
@@ -192,16 +218,16 @@ export default function PatioPlannerInteractive(){
     else { placeAt(e.clientX, e.clientY, e.altKey); }
   }
   function onMouseMove(e){ if (!drag) return; const svg = svgRef.current; const pt = svg.createSVGPoint(); pt.x=e.clientX; pt.y=e.clientY; const ctm = svg.getScreenCTM(); if (!ctm) return; const loc = pt.matrixTransform(ctm.inverse()); let x=loc.x/scale - drag.dx; let y=loc.y/scale - drag.dy; x = snapValue(x, snap); y = snapValue(y, snap); setPlacements(prev=>prev.map(p=> p.id===drag.id? { ...p, x, y }: p)); }
-  function onMouseUp(){ if (!drag) return; const p = placements.find(t=>t.id===drag.id); if (p){ const rect = { x:p.x, y:p.y, w:p.w, h:p.h }; if (intersectsHole(rect) || placements.some(q=> q.id!==p.id && rectsOverlap(rect,q))){ undo(); } else { pushHistory(); } } setDrag(null); }
+  function onMouseUp(){ if (!drag) return; const p = placements.find(t=>t.id===drag.id); if (p){ const rect = { x:p.x, y:p.y, w:p.w, h:p.h }; if (entirelyOutside(rect) || placements.some(q=> q.id!==p.id && rectsOverlap(rect,q))){ undo(); } else { pushHistory(); } } setDrag(null); }
 
-  // Rotate selected (allow outside)
+  // Rotate selected (allow outside; forbid fully outside and overlap after rotation)
   function rotateSelected(){
     const sel = placements.find(p=>p.id===selectedId); if (!sel) return;
     const type = TILE_TYPES[TYPE_INDEX[sel.key]];
     const newRot = !sel.rot; const size = newRot? rotateSize(type.w,type.h): { w:type.w, h:type.h };
     const x = snapValue(sel.x, snap), y = snapValue(sel.y, snap);
     const rect = { x, y, w:size.w, h:size.h };
-    if (intersectsHole(rect) || placements.some(q=> q.id!==sel.id && rectsOverlap(rect,q))) return;
+    if (entirelyOutside(rect) || placements.some(q=> q.id!==sel.id && rectsOverlap(rect,q))) return;
     pushHistory(); setPlacements(prev=> prev.map(p=> p.id===sel.id? { ...p, x, y, w:size.w, h:size.h, rot:newRot }: p));
   }
 
@@ -234,11 +260,14 @@ export default function PatioPlannerInteractive(){
 
   const s = scale;
 
-  // Hatch pattern for outside cuts
-  const hatch = (
+  // Hatch patterns for cuts
+  const defs = (
     <defs>
       <pattern id="outsideHatch" patternUnits="userSpaceOnUse" width={8} height={8} patternTransform="rotate(45)">
         <line x1="0" y1="0" x2="0" y2="8" stroke="#cc0000" strokeWidth="2" />
+      </pattern>
+      <pattern id="holeHatch" patternUnits="userSpaceOnUse" width={8} height={8} patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="8" stroke="#0066cc" strokeWidth="2" />
       </pattern>
     </defs>
   );
@@ -284,9 +313,9 @@ export default function PatioPlannerInteractive(){
         <div style={{ color:'#555' }}>Rotate: <kbd>R</kbd>/<kbd>[</kbd>/<kbd>]</kbd> · Delete: <kbd>Del</kbd>/<kbd>Backspace</kbd> · Undo: <kbd>Ctrl/⌘+Z</kbd> · Redo: <kbd>Ctrl/⌘+Y</kbd> or <kbd>Shift+Z</kbd> · Hold <kbd>Alt</kbd> to bypass snap on placement</div>
       </div>
 
-      <svg ref={svgRef} width={W*s + 320} height={H*s + 40} viewBox={`0 0 ${W*s + 320} ${H*s + 40}`} style={{ background:'#fff' }}
+      <svg ref={svgRef} width={W*s + 340} height={H*s + 40} viewBox={`0 0 ${W*s + 340} ${H*s + 40}`} style={{ background:'#fff' }}
            onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp}>
-        {hatch}
+        {defs}
         {/* Border */}
         <rect x={0} y={0} width={W*s} height={H*s} fill="#f9fafb" stroke="#333" strokeWidth={2} />
 
@@ -311,17 +340,20 @@ export default function PatioPlannerInteractive(){
         {/* Original hole */}
         <rect x={ORIGINAL_HOLE.x*s} y={ORIGINAL_HOLE.y*s} width={ORIGINAL_HOLE.w*s} height={ORIGINAL_HOLE.h*s}
               fill="#ffffff" stroke="#0066cc" strokeDasharray="6 4" strokeWidth={1.5} />
-        <text x={(ORIGINAL_HOLE.x+1)*s} y={(ORIGINAL_HOLE.y-1)*s} fontSize={12} fill="#0066cc">Original 25×25 Hole</text>
+        <text x={(ORIGINAL_HOLE.x+1)*s} y={(ORIGINAL_HOLE.y-1)*s} fontSize={12} fill="#0066cc">Original 25×25 Hole (treated as cutout)</text>
 
-        {/* Placements with outside-cut indication */}
+        {/* Placements with edge & hole cut indication */}
         {placements.map(p=> {
           const ov = overflowInfo(p);
+          const hi = holeTrimInfo(p);
           return (
             <g key={p.id}>
               {/* inside (clipped to patio) */}
               <clipPath id={`clip-${p.id}`}><rect x={0} y={0} width={W*s} height={H*s} /></clipPath>
-              <rect x={p.x*s} y={p.y*s} width={p.w*s} height={p.h*s} fill={p.color} stroke={p.id===selectedId?"#111":"#555"} strokeWidth={p.id===selectedId?2:0.8} clipPath={`url(#clip-${p.id})`} />
-              {/* outside bands */}
+              <rect x={p.x*s} y={p.y*s} width={p.w*s} height={p.h*s}
+                    fill={p.color} stroke={p.id===selectedId?"#111":"#555"}
+                    strokeWidth={p.id===selectedId?2:0.8} clipPath={`url(#clip-${p.id})`} />
+              {/* edge overhang hatches */}
               {ov && ov.left>0 && (
                 <rect x={p.x*s} y={p.y*s} width={ov.left*s} height={p.h*s} fill="url(#outsideHatch)" opacity={0.75} />
               )}
@@ -329,13 +361,23 @@ export default function PatioPlannerInteractive(){
                 <rect x={(Math.max(p.x, W))*s} y={p.y*s} width={ov.right*s} height={p.h*s} fill="url(#outsideHatch)" opacity={0.75} />
               )}
               {ov && ov.top>0 && (
-                <rect x={(Math.max(p.x,0))*s} y={p.y*s} width={Math.max(0, Math.min(p.x+p.w, W) - Math.max(p.x,0))*s} height={ov.top*s} fill="url(#outsideHatch)" opacity={0.75} />
+                <rect x={(Math.max(p.x,0))*s} y={p.y*s}
+                      width={Math.max(0, Math.min(p.x+p.w, W) - Math.max(p.x,0))*s}
+                      height={ov.top*s} fill="url(#outsideHatch)" opacity={0.75} />
               )}
               {ov && ov.bottom>0 && (
-                <rect x={(Math.max(p.x,0))*s} y={(Math.max(p.y, H))*s} width={Math.max(0, Math.min(p.x+p.w, W) - Math.max(p.x,0))*s} height={ov.bottom*s} fill="url(#outsideHatch)" opacity={0.75} />
+                <rect x={(Math.max(p.x,0))*s} y={(Math.max(p.y, H))*s}
+                      width={Math.max(0, Math.min(p.x+p.w, W) - Math.max(p.x,0))*s}
+                      height={ov.bottom*s} fill="url(#outsideHatch)" opacity={0.75} />
+              )}
+              {/* hole overlap hatch */}
+              {hi && (
+                <rect x={hi.x*s} y={hi.y*s} width={hi.w*s} height={hi.h*s} fill="url(#holeHatch)" opacity={0.75} />
               )}
               {/* label */}
-              <text x={(p.x+0.3)*s} y={(p.y+0.8)*s} fontSize={10} fill="#111">{p.key}{p.auto?"*":""}{ov?" (CUT)":""}</text>
+              <text x={(p.x+0.3)*s} y={(p.y+0.8)*s} fontSize={10} fill="#111">
+                {p.key}{p.auto?"*":""}{(ov||hi)?" (CUT)":""}
+              </text>
             </g>
           );
         })}
@@ -351,22 +393,32 @@ export default function PatioPlannerInteractive(){
           ))}
           <g transform={`translate(0, ${20 + TILE_TYPES.length*18 + 12})`}>
             <rect width={14} height={10} fill="url(#outsideHatch)" stroke="#cc0000" />
-            <text x={22} y={9}>Outside grid → needs cut</text>
+            <text x={22} y={9}>Outside patio → cut</text>
+          </g>
+          <g transform={`translate(0, ${20 + TILE_TYPES.length*18 + 32})`}>
+            <rect width={14} height={10} fill="url(#holeHatch)" stroke="#0066cc" />
+            <text x={22} y={9}>Inside 25×25 hole → cutout</text>
           </g>
 
           {/* Cuts summary */}
-          <g transform={`translate(0, ${20 + TILE_TYPES.length*18 + 40})`}>
-            <text fontSize={13} fontWeight="bold">Cuts Required (outside)</text>
-            {overflowList.length===0 && <text y={18}>None</text>}
-            {overflowList.slice(0,18).map((i,idx)=> (
-              <text key={i.id} y={18 + idx*16}>
-                • {i.key}: L{i.left}\" R{i.right}\" T{i.top}\" B{i.bottom}\" (area {i.area}\"²)
+          <g transform={`translate(0, ${20 + TILE_TYPES.length*18 + 60})`}>
+            <text fontSize={13} fontWeight="bold">Cuts Required (edge & hole)</text>
+            {overflowList.length===0 && holeList.length===0 && <text y={18}>None</text>}
+
+            {[...overflowList.slice(0,18), ...holeList.slice(0, Math.max(0, 18 - overflowList.slice(0,18).length))].map((i,idx)=> (
+              <text key={`${i.type}-${i.id}`} y={18 + idx*16}>
+                {i.type==="HOLE"
+                  ? `• ${i.key}: HOLE notch ${i.w}×${i.h} (area ${i.area}"²)`
+                  : `• ${i.key}: L${i.left}" R${i.right}" T${i.top}" B${i.bottom}" (area ${i.area}"²)`}
               </text>
             ))}
-            {overflowList.length>18 && (
-              <text y={18 + 18*16}>… +{overflowList.length-18} more</text>
+
+            {(overflowList.length + holeList.length) > 18 && (
+              <text y={18 + 18*16}>… +{overflowList.length + holeList.length - 18} more</text>
             )}
-            <text y={18 + Math.min(overflowList.length,18)*16 + 12} fontWeight="bold">Total trim area: {Math.round(totalTrimArea)}\"²</text>
+            <text y={18 + Math.min(overflowList.length + holeList.length,18)*16 + 12} fontWeight="bold">
+              Total trim area: {Math.round(totalTrimArea)}"²
+            </text>
           </g>
         </g>
       </svg>

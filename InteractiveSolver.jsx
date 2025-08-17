@@ -45,7 +45,7 @@ const LS_KEY = "patio-planner-v4";
 function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
 function rectsOverlap(a,b){ return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
 function insidePatio(r){ return r.x >= 0 && r.y >= 0 && r.x + r.w <= W && r.y + r.h <= H; }
-function intersectsHole(r){ return rectsOverlap(r, ORIGINAL_HOLE); }
+function intersectsHole(r){ return false; }
 function snapValue(v, grid){ return Math.round(v / grid) * grid; }
 function rotateSize(w,h){ return { w: h, h: w }; }
 function uid(){ return Math.random().toString(36).slice(2,9); }
@@ -88,7 +88,7 @@ function autofill(placements, remainingInv){
       // skip if already occupied
       if (occupied.some(p => x>=p.x && x<p.x+p.w && y>=p.y && y<p.y+p.h)) continue;
       // skip if inside hole
-      if (x>=ORIGINAL_HOLE.x && x<ORIGINAL_HOLE.x+ORIGINAL_HOLE.w && y>=ORIGINAL_HOLE.y && y<ORIGINAL_HOLE.y+ORIGINAL_HOLE.h) continue;
+      
       for (const t of types){
         if (tryPlaceAt(x,y,t,false)) break;
         if (tryPlaceAt(x,y,t,true)) break;
@@ -171,7 +171,7 @@ export default function PatioPlannerInteractive(){
     // inventory check
     if ((remaining[selectedKey]||0) <= 0) return; // out of stock
     // forbid covering the original hole, and forbid overlap with other tiles (even outside)
-    if (intersectsHole(rect)) return;
+    
     for (const p of placements){ if (rectsOverlap(rect, p)) return; }
     const p = { id: uid(), key: selectedKey, x, y, w: type.w, h: type.h, rot: false, color: type.color };
     pushHistory(); setPlacements(prev=>[...prev, p]); setSelectedId(p.id);
